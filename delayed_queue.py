@@ -77,7 +77,7 @@ class DelayedTask:
         callback: Callable,
         args: tuple,
         kwargs: dict,
-        task_id: Optional[int] = None,
+        task_id: int,
     ):
         self.execute_time = execute_time
         self.seq = seq
@@ -97,6 +97,8 @@ class DelayedQueue:
     def __init__(self, worker_count: int = 4, db_path: Optional[str] = None):
         self._heap: list[DelayedTask] = []
         self._seq = 0
+        self._next_id = 1
+        self._tasks_by_id: dict[int, DelayedTask] = {}
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
         self._running = True
@@ -121,7 +123,7 @@ class DelayedQueue:
         callback: Callable,
         *args: Any,
         **kwargs: Any,
-    ) -> DelayedTask:
+    ) -> int:
         if delay < 0:
             raise ValueError("delay must be non-negative")
         execute_time = time.time() + delay
@@ -132,19 +134,26 @@ class DelayedQueue:
         with self._condition:
             if self._store is not None:
                 task_id = self._store.save_task(execute_time, callback_key, args, kwargs)
+                self._next_id = max(self._next_id, task_id + 1)
+            else:
+                task_id = self._next_id
+                self._next_id += 1
             task = DelayedTask(execute_time, self._seq, callback, args, kwargs, task_id=task_id)
             self._seq += 1
+            self._tasks_by_id[task_id] = task
             heapq.heappush(self._heap, task)
             self._condition.notify()
-            return task
+            return task_id
 
-    def cancel(self, task: DelayedTask) -> bool:
+    def cancel(self, task_id: int) -> bool:
         with self._lock:
-            if task.cancelled:
+            task = self._tasks_by_id.get(task_id)
+            if task is None or task.cancelled:
                 return False
             task.cancelled = True
-            if self._store is not None and task.id is not None:
-                self._store.delete_task(task.id)
+            del self._tasks_by_id[task_id]
+            if self._store is not None:
+                self._store.delete_task(task_id)
             return True
 
     def shutdown(self, wait: bool = True) -> None:
@@ -194,6 +203,7 @@ class DelayedQueue:
     def _recover_persisted_tasks(self) -> None:
         rows = self._store.load_all_tasks()
         now = time.time()
+        max_id = 0
         for task_id, exec_time, cb_key, args, kwargs in rows:
             callback = self._lookup_callback(cb_key)
             if callback is None:
@@ -203,7 +213,11 @@ class DelayedQueue:
             effective_time = max(exec_time, now)
             task = DelayedTask(effective_time, self._seq, callback, args, kwargs, task_id=task_id)
             self._seq += 1
+            self._tasks_by_id[task_id] = task
             heapq.heappush(self._heap, task)
+            if task_id > max_id:
+                max_id = task_id
+        self._next_id = max(self._next_id, max_id + 1)
 
     def _dispatch_loop(self) -> None:
         while True:
@@ -217,16 +231,18 @@ class DelayedQueue:
                     candidate = self._heap[0]
                     if candidate.cancelled:
                         heapq.heappop(self._heap)
+                        self._tasks_by_id.pop(candidate.id, None)
                         continue
                     if candidate.execute_time <= now:
                         task = heapq.heappop(self._heap)
+                        self._tasks_by_id.pop(task.id, None)
                         break
                     timeout = candidate.execute_time - now
                     self._condition.wait(timeout=timeout)
                 else:
                     return
 
-            if self._store is not None and task.id is not None:
+            if self._store is not None:
                 self._store.delete_task(task.id)
             self._executor.submit(task.callback, *task.args, **task.kwargs)
 
@@ -284,22 +300,52 @@ if __name__ == "__main__":
     if os.path.exists(db_path):
         os.remove(db_path)
 
+    fired: list[str] = []
+
     def on_fire(name: str, delay: float):
+        fired.append(name)
         print(f"[{time.strftime('%H:%M:%S')}] task '{name}' fired (expected ~{delay:.1f}s)")
 
-    print("=== Phase 1: submit tasks and shutdown before they fire ===")
-    queue = DelayedQueue(worker_count=2, db_path=db_path)
-    queue.submit(3.0, on_fire, "A", 3.0)
-    queue.submit(5.0, on_fire, "B", 5.0)
-    queue.submit(2.0, on_fire, "C", 2.0)
-    print("Submitted tasks, shutting down immediately...")
-    queue.shutdown(wait=True)
+    print("=== Test 1: in-memory mode, id-based cancel ===")
+    q1 = DelayedQueue(worker_count=2)
+    t1 = q1.submit(1.0, on_fire, "A", 1.0)
+    t2 = q1.submit(0.5, on_fire, "B-cancelled", 0.5)
+    t3 = q1.submit(1.5, on_fire, "C", 1.5)
+    print(f"  submit returned ids: A={t1}, B-cancelled={t2}, C={t3}")
+    ok = q1.cancel(t2)
+    print(f"  cancel task B-cancelled (id={t2}) -> {ok}")
+    ok2 = q1.cancel(t2)
+    print(f"  cancel same task again -> {ok2} (should be False)")
+    ok3 = q1.cancel(999999)
+    print(f"  cancel non-existent id -> {ok3} (should be False)")
+    time.sleep(3)
+    q1.shutdown(wait=True)
+    print(f"  fired tasks: {fired} (expected: ['A', 'C'])")
+    assert fired == ["A", "C"], f"FAIL: {fired}"
+    fired.clear()
 
-    print("\n=== Phase 2: restart queue (tasks should fire on their schedule) ===")
-    queue2 = DelayedQueue(worker_count=2, db_path=db_path)
-    queue2.submit(1.5, on_fire, "D-new", 1.5)
+    print("\n=== Test 2: persistent mode, submit+cancel+shutdown ===")
+    q2 = DelayedQueue(worker_count=2, db_path=db_path)
+    id_a = q2.submit(3.0, on_fire, "A", 3.0)
+    id_b = q2.submit(5.0, on_fire, "B", 5.0)
+    id_c = q2.submit(2.0, on_fire, "C", 2.0)
+    id_d = q2.submit(4.0, on_fire, "D-cancelled", 4.0)
+    print(f"  ids: A={id_a} B={id_b} C={id_c} D-cancelled={id_d}")
+    print(f"  cancel D-cancelled (id={id_d}) -> {q2.cancel(id_d)}")
+    print("  shutting down immediately...")
+    q2.shutdown(wait=True)
+    assert fired == [], f"FAIL: no tasks should fire, got {fired}"
+
+    print("\n=== Test 3: restart queue, tasks should fire (persisted cancel not restored) ===")
+    q3 = DelayedQueue(worker_count=2, db_path=db_path)
+    id_new = q3.submit(1.5, on_fire, "E-new", 1.5)
+    print(f"  submitted new task E-new (id={id_new})")
     time.sleep(7)
-    queue2.shutdown(wait=True)
+    q3.shutdown(wait=True)
+    print(f"  fired tasks: {fired}")
+    assert "D-cancelled" not in fired, "FAIL: cancelled task was restored"
+    for expected in ["E-new", "C", "A", "B"]:
+        assert expected in fired, f"FAIL: expected task '{expected}' missing"
     if os.path.exists(db_path):
         os.remove(db_path)
-    print("Done.")
+    print("\nAll tests passed.")
